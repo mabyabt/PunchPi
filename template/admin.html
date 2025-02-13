@@ -1,0 +1,153 @@
+<!-- admin.html -->
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RFID System - Admin Panel</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+            background-color: #f5f5f5;
+        }
+        .navbar {
+            background: #343a40;
+            padding: 15px;
+            color: white;
+        }
+        .navbar a {
+            color: white;
+            text-decoration: none;
+            margin-right: 20px;
+        }
+        .container {
+            padding: 20px;
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        .card {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        .stat-card {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            text-align: center;
+        }
+        .stat-value {
+            font-size: 36px;
+            font-weight: bold;
+            color: #007bff;
+        }
+        .stat-label {
+            color: #666;
+            margin-top: 5px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+        }
+        th {
+            background-color: #f8f9fa;
+        }
+        .btn {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            color: white;
+        }
+        .btn-primary { background-color: #007bff; }
+        .btn-danger { background-color: #dc3545; }
+    </style>
+</head>
+<body>
+    <div class="navbar">
+        <a href="/admin">Dashboard</a>
+        <a href="/manage-users">Manage Users</a>
+        <a href="/logs">View Logs</a>
+        <a href="/logout" style="float: right;">Logout</a>
+    </div>
+    
+    <div class="container">
+        <h1>Admin Dashboard</h1>
+        
+        <div class="grid">
+            <div class="stat-card">
+                <div class="stat-value" id="totalEmployees">0</div>
+                <div class="stat-label">Total Employees</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="activeEmployees">0</div>
+                <div class="stat-label">Currently Active</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="todayScans">0</div>
+                <div class="stat-label">Today's Scans</div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Recent Activity</h2>
+            <table id="recentActivity">
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Employee</th>
+                        <th>Event</th>
+                    </tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        function loadDashboardData() {
+            // Load statistics
+            fetch('/api/stats')
+                .then(response => response.json())
+                .then(data => {
+                    document.getElementById('totalEmployees').textContent = data.totalEmployees;
+                    document.getElementById('activeEmployees').textContent = data.activeEmployees;
+                    document.getElementById('todayScans').textContent = data.todayScans;
+                });
+
+            // Load recent activity
+            fetch('/api/logs?limit=10')
+                .then(response => response.json())
+                .then(data => {
+                    const tbody = document.querySelector('#recentActivity tbody');
+                    tbody.innerHTML = '';
+                    data.forEach(log => {
+                        const row = document.createElement('tr');
+                        row.innerHTML = `
+                            <td>${new Date(log.timestamp).toLocaleString()}</td>
+                            <td>${log.name}</td>
+                            <td>${log.event_type.toUpperCase()}</td>
+                        `;
+                        tbody.appendChild(row);
+                    });
+                });
+        }
+
+        // Load initial data and refresh every minute
+        loadDashboardData();
+        setInterval(loadDashboardData, 60000);
+    </script>
+</body>

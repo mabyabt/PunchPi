@@ -1,0 +1,114 @@
+<!-- employee.html -->
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RFID System - Employee Panel</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+            background-color: #f5f5f5;
+        }
+        .navbar {
+            background: #343a40;
+            padding: 15px;
+            color: white;
+        }
+        .navbar a {
+            color: white;
+            text-decoration: none;
+            margin-right: 20px;
+        }
+        .container {
+            padding: 20px;
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        .card {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .status {
+            text-align: center;
+            padding: 30px;
+            margin-bottom: 20px;
+            border-radius: 8px;
+        }
+        .status.in {
+            background-color: #d4edda;
+            color: #155724;
+        }
+        .status.out {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+        .time-log {
+            margin-top: 10px;
+            padding: 10px;
+            border-bottom: 1px solid #eee;
+        }
+        .time {
+            font-weight: bold;
+            color: #007bff;
+        }
+    </style>
+</head>
+<body>
+    <div class="navbar">
+        <a href="/employee">My Dashboard</a>
+        <a href="/logout" style="float: right;">Logout</a>
+    </div>
+    
+    <div class="container">
+        <div class="card">
+            <h1>Welcome, <span id="employeeName"></span></h1>
+            <div id="currentStatus" class="status">
+                Loading status...
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Today's Activity</h2>
+            <div id="todayLogs"></div>
+        </div>
+    </div>
+
+    <script>
+        function loadEmployeeData() {
+            // Load employee info and status
+            fetch('/api/employee/status')
+                .then(response => response.json())
+                .then(data => {
+                    document.getElementById('employeeName').textContent = data.name;
+                    const status = document.getElementById('currentStatus');
+                    status.className = `status ${data.status}`;
+                    status.textContent = data.status === 'in' ? 'Currently Clocked In' : 'Currently Clocked Out';
+                });
+
+            // Load today's logs
+            fetch('/api/employee/logs/today')
+                .then(response => response.json())
+                .then(data => {
+                    const logsDiv = document.getElementById('todayLogs');
+                    logsDiv.innerHTML = '';
+                    data.forEach(log => {
+                        const logEntry = document.createElement('div');
+                        logEntry.className = 'time-log';
+                        logEntry.innerHTML = `
+                            <span class="time">${new Date(log.timestamp).toLocaleTimeString()}</span>
+                            - ${log.event_type.toUpperCase()}
+                        `;
+                        logsDiv.appendChild(logEntry);
+                    });
+                });
+        }
+
+        // Load initial data and refresh every minute
+        loadEmployeeData();
+        setInterval(loadEmployeeData, 60000);
+    </script>
+</body>
