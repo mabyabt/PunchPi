@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Reports - Employee Time Tracking</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <header>
+        <h1>Employee Time Tracking</h1>
+        <nav>
+            <ul>
+                <li><a href="/dashboard">Dashboard</a></li>
+                <li><a href="/employees">Employees</a></li>
+                <li><a href="/reports">Reports</a></li>
+                <li><a href="/clock">Clock In/Out</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <h2>Reports</h2>
+        <section>
+            <h3>Generate Report</h3>
+            <form id="report-form">
+                <label for="start-date">Start Date:</label>
+                <input type="date" id="start-date" name="start-date" required>
+                <label for="end-date">End Date:</label>
+                <input type="date" id="end-date" name="end-date" required>
+                <button type="submit">Generate Report</button>
+            </form>
+        </section>
+
+        <section>
+            <h3>Report Results</h3>
+            <table id="report-table">
+                <thead>
+                    <tr>
+                        <th>Employee</th>
+                        <th>Clock In</th>
+                        <th>Clock Out</th>
+                        <th>Total Hours</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <!-- Report data will be populated here -->
+                    <tr>
+                        <td colspan="4">No report data available.</td>
+                    </tr>
+                </tbody>
+            </table>
+        </section>
+    </main>
+
+    <footer>
+        <p>&copy; 2023 Employee Time Tracking System</p>
+    </footer>
+
+    <script src="/static/reports.js"></script>
+</body>
+</html>
