@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"log"
@@ -13,217 +14,153 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/gorilla/mux"
+	"github.com/gorilla/websocket"
 )
+
+// ... (previous struct definitions remain the same)
+
+// New structs for RFID device communication
+type RFIDDevice struct {
+	ID       string    `json:"id"`
+	LastSeen time.Time `json:"last_seen"`
+	Status   string    `json:"status"`
+}
+
+type CardScanEvent struct {
+	DeviceID string    `json:"device_id"`
+	CardUID  string    `json:"card_uid"`
+	Time     time.Time `json:"time"`
+}
 
 var (
 	db        *sql.DB
 	templates *template.Template
+	upgrader  = websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		CheckOrigin: func(r *http.Request) bool {
+			return true // Allow all origins for development
+		},
+	}
+	activeDevices = make(map[string]*websocket.Conn)
 )
 
-// Struct definitions
-type User struct {
-	ID       int    `json:"id"`
-	Username string `json:"username"`
-	Password string `json:"-"`
-	Role     string `json:"role"`
-}
+// ... (previous initDB function remains the same)
 
-type Employee struct {
-	ID           int       `json:"id"`
-	Name         string    `json:"name"`
-	CardUID      string    `json:"card_uid"`
-	IsPresent    bool      `json:"is_present"`
-	LastClockIn  time.Time `json:"last_clock_in"`
-	LastClockOut time.Time `json:"last_clock_out"`
-}
-
-type TimeRecord struct {
-	ID         int       `json:"id"`
-	EmployeeID int       `json:"employee_id"`
-	Name       string    `json:"name"`
-	ClockIn    time.Time `json:"clock_in"`
-	ClockOut   time.Time `json:"clock_out"`
-	TotalHours float64   `json:"total_hours"`
-}
-
-type PageData struct {
-	User         *User
-	Employees    []Employee
-	TimeRecords  []TimeRecord
-	Message      string
-	CurrentTime  time.Time
-	TotalPresent int
-}
-
-func initDB() error {
-	log.Println("Initializing database...")
-	dbDir := "db"
-	if err := os.MkdirAll(dbDir, 0755); err != nil {
-		return fmt.Errorf("failed to create database directory: %w", err)
-	}
-
-	dbPath := filepath.Join(dbDir, "timetrack.db")
-	var err error
-	db, err = sql.Open("sqlite3", dbPath)
+// New function to handle RFID device WebSocket connections
+func handleDeviceWebSocket(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		return fmt.Errorf("failed to open database: %w", err)
-	}
-
-	// Create tables
-	createTables := `
-	CREATE TABLE IF NOT EXISTS users (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		username TEXT UNIQUE NOT NULL,
-		password TEXT NOT NULL,
-		role TEXT NOT NULL,
-		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-	);
-
-	CREATE TABLE IF NOT EXISTS employees (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		name TEXT NOT NULL,
-		card_uid TEXT UNIQUE NOT NULL,
-		is_present BOOLEAN DEFAULT FALSE,
-		last_clock_in DATETIME,
-		last_clock_out DATETIME,
-		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-	);
-
-	CREATE TABLE IF NOT EXISTS time_records (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		employee_id INTEGER NOT NULL,
-		clock_in DATETIME NOT NULL,
-		clock_out DATETIME,
-		total_hours REAL,
-		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-		FOREIGN KEY (employee_id) REFERENCES employees(id)
-	);
-
-	CREATE INDEX IF NOT EXISTS idx_card_uid ON employees(card_uid);
-	CREATE INDEX IF NOT EXISTS idx_employee_time ON time_records(employee_id, clock_in);`
-
-	if _, err = db.Exec(createTables); err != nil {
-		return fmt.Errorf("failed to create tables: %w", err)
-	}
-
-	// Create default admin if not exists
-	var count int
-	if err = db.QueryRow("SELECT COUNT(*) FROM users WHERE username = 'admin'").Scan(&count); err != nil {
-		return fmt.Errorf("failed to check admin user: %w", err)
-	}
-
-	if count == 0 {
-		hashedPassword := hashPassword("admin")
-		if _, err = db.Exec(`
-			INSERT INTO users (username, password, role) 
-			VALUES (?, ?, ?)`,
-			"admin", hashedPassword, "admin"); err != nil {
-			return fmt.Errorf("failed to create admin user: %w", err)
-		}
-		log.Println("Default admin user created (admin/admin)")
-	}
-
-	return nil
-}
-
-func hashPassword(password string) string {
-	hash := sha256.Sum256([]byte(password))
-	return hex.EncodeToString(hash[:])
-}
-
-// Handlers
-func dashboardHandler(w http.ResponseWriter, r *http.Request) {
-	data := PageData{
-		CurrentTime: time.Now(),
-	}
-
-	// Get present employees
-	rows, err := db.Query(`
-		SELECT id, name, card_uid, is_present, last_clock_in, last_clock_out 
-		FROM employees 
-		ORDER BY name`)
-	if err != nil {
-		log.Printf("Error fetching employees: %v", err)
-		http.Error(w, "Server error", http.StatusInternalServerError)
+		log.Printf("WebSocket upgrade error: %v", err)
 		return
 	}
-	defer rows.Close()
+	defer conn.Close()
 
-	for rows.Next() {
-		var emp Employee
-		if err := rows.Scan(&emp.ID, &emp.Name, &emp.CardUID, &emp.IsPresent,
-			&emp.LastClockIn, &emp.LastClockOut); err != nil {
-			log.Printf("Error scanning employee: %v", err)
-			continue
-		}
-		data.Employees = append(data.Employees, emp)
-		if emp.IsPresent {
-			data.TotalPresent++
-		}
+	deviceID := r.URL.Query().Get("device_id")
+	if deviceID == "" {
+		log.Println("Device ID not provided")
+		return
 	}
 
-	// Get recent time records
-	timeRows, err := db.Query(`
-		SELECT tr.id, tr.employee_id, e.name, tr.clock_in, tr.clock_out,
-			ROUND(CAST((JULIANDAY(tr.clock_out) - JULIANDAY(tr.clock_in)) * 24 AS REAL), 2) as total_hours
-		FROM time_records tr
-		JOIN employees e ON tr.employee_id = e.id
-		WHERE tr.clock_out IS NOT NULL
-		ORDER BY tr.clock_in DESC LIMIT 10`)
-	if err != nil {
-		log.Printf("Error fetching time records: %v", err)
-	} else {
-		defer timeRows.Close()
-		for timeRows.Next() {
-			var record TimeRecord
-			if err := timeRows.Scan(&record.ID, &record.EmployeeID, &record.Name,
-				&record.ClockIn, &record.ClockOut, &record.TotalHours); err != nil {
-				log.Printf("Error scanning time record: %v", err)
-				continue
-			}
-			data.TimeRecords = append(data.TimeRecords, record)
-		}
-	}
+	activeDevices[deviceID] = conn
+	defer delete(activeDevices, deviceID)
 
-	if err := templates.ExecuteTemplate(w, "dashboard.html", data); err != nil {
-		log.Printf("Template error: %v", err)
-		http.Error(w, "Server error", http.StatusInternalServerError)
-	}
-}
+	log.Printf("Device connected: %s", deviceID)
 
-func employeesHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodPost {
-		// Add new employee
-		name := r.FormValue("name")
-		cardUID := r.FormValue("card_uid")
-
-		if name == "" || cardUID == "" {
-			http.Error(w, "Name and Card UID are required", http.StatusBadRequest)
-			return
-		}
-
-		_, err := db.Exec(`
-			INSERT INTO employees (name, card_uid)
-			VALUES (?, ?)`, name, cardUID)
-
+	for {
+		var scanEvent CardScanEvent
+		err := conn.ReadJSON(&scanEvent)
 		if err != nil {
-			log.Printf("Error adding employee: %v", err)
-			http.Error(w, "Error adding employee", http.StatusInternalServerError)
-			return
+			log.Printf("WebSocket read error: %v", err)
+			break
 		}
 
-		http.Redirect(w, r, "/employees", http.StatusSeeOther)
-		return
+		scanEvent.DeviceID = deviceID
+		scanEvent.Time = time.Now()
+
+		// Process the card scan
+		if err := processCardScan(scanEvent); err != nil {
+			log.Printf("Error processing card scan: %v", err)
+			conn.WriteJSON(map[string]string{"status": "error", "message": err.Error()})
+		} else {
+			conn.WriteJSON(map[string]string{"status": "success"})
+		}
+	}
+}
+
+// New function to process card scans
+func processCardScan(scan CardScanEvent) error {
+	// Look up employee
+	var employee Employee
+	err := db.QueryRow(`
+		SELECT id, name, is_present 
+		FROM employees 
+		WHERE card_uid = ?`, scan.CardUID).Scan(&employee.ID, &employee.Name, &employee.IsPresent)
+	
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("unknown card: %s", scan.CardUID)
+	} else if err != nil {
+		return fmt.Errorf("database error: %v", err)
 	}
 
-	// Get all employees
+	// Start transaction
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("transaction error: %v", err)
+	}
+	defer tx.Rollback()
+
+	if !employee.IsPresent {
+		// Clock in
+		_, err = tx.Exec(`
+			INSERT INTO time_records (employee_id, clock_in)
+			VALUES (?, ?)`, employee.ID, scan.Time)
+		if err != nil {
+			return fmt.Errorf("clock-in error: %v", err)
+		}
+
+		_, err = tx.Exec(`
+			UPDATE employees 
+			SET is_present = TRUE, last_clock_in = ? 
+			WHERE id = ?`, scan.Time, employee.ID)
+	} else {
+		// Clock out
+		var recordID int
+		err = tx.QueryRow(`
+			SELECT id FROM time_records 
+			WHERE employee_id = ? AND clock_out IS NULL 
+			ORDER BY clock_in DESC LIMIT 1`, employee.ID).Scan(&recordID)
+		if err != nil {
+			return fmt.Errorf("record lookup error: %v", err)
+		}
+
+		_, err = tx.Exec(`
+			UPDATE time_records 
+			SET clock_out = ?,
+				total_hours = ROUND(CAST((JULIANDAY(?) - JULIANDAY(clock_in)) * 24 AS REAL), 2)
+			WHERE id = ?`, scan.Time, scan.Time, recordID)
+		if err != nil {
+			return fmt.Errorf("clock-out error: %v", err)
+		}
+
+		_, err = tx.Exec(`
+			UPDATE employees 
+			SET is_present = FALSE, last_clock_out = ? 
+			WHERE id = ?`, scan.Time, employee.ID)
+	}
+
+	return tx.Commit()
+}
+
+// New API endpoints
+func apiGetEmployees(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query(`
 		SELECT id, name, card_uid, is_present, last_clock_in, last_clock_out 
 		FROM employees 
 		ORDER BY name`)
 	if err != nil {
-		log.Printf("Error fetching employees: %v", err)
-		http.Error(w, "Server error", http.StatusInternalServerError)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
@@ -233,60 +170,47 @@ func employeesHandler(w http.ResponseWriter, r *http.Request) {
 		var emp Employee
 		if err := rows.Scan(&emp.ID, &emp.Name, &emp.CardUID, &emp.IsPresent,
 			&emp.LastClockIn, &emp.LastClockOut); err != nil {
-			log.Printf("Error scanning employee: %v", err)
-			continue
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
 		employees = append(employees, emp)
 	}
 
-	data := PageData{
-		Employees: employees,
-	}
-
-	if err := templates.ExecuteTemplate(w, "employees.html", data); err != nil {
-		log.Printf("Template error: %v", err)
-		http.Error(w, "Server error", http.StatusInternalServerError)
-	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(employees)
 }
 
-func reportsHandler(w http.ResponseWriter, r *http.Request) {
-	// Get date range from query params or use default (current month)
-	now := time.Now()
+func apiGetTimeRecords(w http.ResponseWriter, r *http.Request) {
 	startDate := r.URL.Query().Get("start")
 	endDate := r.URL.Query().Get("end")
+	employeeID := r.URL.Query().Get("employee_id")
 
-	var start, end time.Time
-	var err error
-
-	if startDate != "" {
-		start, err = time.Parse("2006-01-02", startDate)
-		if err != nil {
-			start = time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
-		}
-	} else {
-		start = time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
-	}
-
-	if endDate != "" {
-		end, err = time.Parse("2006-01-02", endDate)
-		if err != nil {
-			end = now
-		}
-	} else {
-		end = now
-	}
-
-	// Get time records for the period
-	rows, err := db.Query(`
+	query := `
 		SELECT tr.id, tr.employee_id, e.name, tr.clock_in, tr.clock_out,
 			ROUND(CAST((JULIANDAY(tr.clock_out) - JULIANDAY(tr.clock_in)) * 24 AS REAL), 2) as total_hours
 		FROM time_records tr
 		JOIN employees e ON tr.employee_id = e.id
-		WHERE tr.clock_in BETWEEN ? AND ?
-		ORDER BY tr.clock_in DESC`, start, end)
+		WHERE 1=1`
+	args := []interface{}{}
+
+	if startDate != "" {
+		query += " AND tr.clock_in >= ?"
+		args = append(args, startDate)
+	}
+	if endDate != "" {
+		query += " AND tr.clock_in <= ?"
+		args = append(args, endDate)
+	}
+	if employeeID != "" {
+		query += " AND tr.employee_id = ?"
+		args = append(args, employeeID)
+	}
+
+	query += " ORDER BY tr.clock_in DESC"
+
+	rows, err := db.Query(query, args...)
 	if err != nil {
-		log.Printf("Error fetching time records: %v", err)
-		http.Error(w, "Server error", http.StatusInternalServerError)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
@@ -296,113 +220,14 @@ func reportsHandler(w http.ResponseWriter, r *http.Request) {
 		var record TimeRecord
 		if err := rows.Scan(&record.ID, &record.EmployeeID, &record.Name,
 			&record.ClockIn, &record.ClockOut, &record.TotalHours); err != nil {
-			log.Printf("Error scanning time record: %v", err)
-			continue
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
 		records = append(records, record)
 	}
 
-	data := PageData{
-		TimeRecords: records,
-	}
-
-	if err := templates.ExecuteTemplate(w, "reports.html", data); err != nil {
-		log.Printf("Template error: %v", err)
-		http.Error(w, "Server error", http.StatusInternalServerError)
-	}
-}
-
-func clockInOutHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	cardUID := r.FormValue("card_uid")
-	if cardUID == "" {
-		http.Error(w, "Card UID is required", http.StatusBadRequest)
-		return
-	}
-
-	// Look up employee
-	var employee Employee
-	err := db.QueryRow(`
-		SELECT id, name, is_present 
-		FROM employees 
-		WHERE card_uid = ?`, cardUID).Scan(&employee.ID, &employee.Name, &employee.IsPresent)
-	
-	if err == sql.ErrNoRows {
-		http.Error(w, "Unknown card", http.StatusNotFound)
-		return
-	} else if err != nil {
-		log.Printf("Database error: %v", err)
-		http.Error(w, "Server error", http.StatusInternalServerError)
-		return
-	}
-
-	// Start transaction
-	tx, err := db.Begin()
-	if err != nil {
-		log.Printf("Transaction error: %v", err)
-		http.Error(w, "Server error", http.StatusInternalServerError)
-		return
-	}
-	defer tx.Rollback()
-
-	now := time.Now()
-
-	if !employee.IsPresent {
-		// Clock in
-		_, err = tx.Exec(`
-			INSERT INTO time_records (employee_id, clock_in)
-			VALUES (?, ?)`, employee.ID, now)
-		if err != nil {
-			log.Printf("Clock-in error: %v", err)
-			http.Error(w, "Server error", http.StatusInternalServerError)
-			return
-		}
-
-		_, err = tx.Exec(`
-			UPDATE employees 
-			SET is_present = TRUE, last_clock_in = ? 
-			WHERE id = ?`, now, employee.ID)
-	} else {
-		// Clock out
-		var recordID int
-		err = tx.QueryRow(`
-			SELECT id FROM time_records 
-			WHERE employee_id = ? AND clock_out IS NULL 
-			ORDER BY clock_in DESC LIMIT 1`, employee.ID).Scan(&recordID)
-		if err != nil {
-			log.Printf("Record lookup error: %v", err)
-			http.Error(w, "Server error", http.StatusInternalServerError)
-			return
-		}
-
-		_, err = tx.Exec(`
-			UPDATE time_records 
-			SET clock_out = ?,
-				total_hours = ROUND(CAST((JULIANDAY(?) - JULIANDAY(clock_in)) * 24 AS REAL), 2)
-			WHERE id = ?`, now, now, recordID)
-		if err != nil {
-			log.Printf("Clock-out error: %v", err)
-			http.Error(w, "Server error", http.StatusInternalServerError)
-			return
-		}
-
-		_, err = tx.Exec(`
-			UPDATE employees 
-			SET is_present = FALSE, last_clock_out = ? 
-			WHERE id = ?`, now, employee.ID)
-	}
-
-	if err = tx.Commit(); err != nil {
-		log.Printf("Transaction commit error: %v", err)
-		http.Error(w, "Server error", http.StatusInternalServerError)
-		return
-	}
-
-	http.Redirect(w, r, "/dashboard", http.StatusSeeOther)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(records)
 }
 
 func main() {
@@ -419,12 +244,25 @@ func main() {
 	}
 	defer db.Close()
 
-	// Set up routes
-	http.HandleFunc("/", dashboardHandler)
-	http.HandleFunc("/dashboard", dashboardHandler)
-	http.HandleFunc("/employees", employeesHandler)
-	http.HandleFunc("/reports", reportsHandler)
-	http.HandleFunc("/clock", clockInOutHandler)
+	// Create router
+	r := mux.NewRouter()
+
+	// Web interface routes
+	r.HandleFunc("/", dashboardHandler)
+	r.HandleFunc("/dashboard", dashboardHandler)
+	r.HandleFunc("/employees", employeesHandler)
+	r.HandleFunc("/reports", reportsHandler)
+	r.HandleFunc("/clock", clockInOutHandler)
+
+	// API routes
+	api := r.PathPrefix("/api").Subrouter()
+	api.HandleFunc("/employees", apiGetEmployees).Methods("GET")
+	api.HandleFunc("/time-records", apiGetTimeRecords).Methods("GET")
+
+	// WebSocket endpoint for RFID devices
+	r.HandleFunc("/ws/device", handleDeviceWebSocket)
 
 	// Start server
 	log.Println("Starting server on :8080...")
+	log.Fatal(http.ListenAndServe(":8080", r))
+}
