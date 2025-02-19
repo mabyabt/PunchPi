@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -20,43 +21,27 @@ var (
 	templates *template.Template
 )
 
-// User type definition
+// Struct definitions
 type User struct {
 	ID       int    `json:"id"`
 	Username string `json:"username"`
-	Password string `json:"-"` // "-" means this field won't be included in JSON
+	Password string `json:"-"`
 	Role     string `json:"role"`
 }
 
-// Initialize templates
-func initTemplates() error {
-	log.Println("Initializing templates...")
-	
-	// Get absolute path to templates directory
-	templatesDir, err := filepath.Abs("templates")
-	if err != nil {
-		return fmt.Errorf("error getting template directory path: %w", err)
-	}
-
-	// Create templates directory if it doesn't exist
-	if err := os.MkdirAll(templatesDir, 0755); err != nil {
-		return fmt.Errorf("failed to create templates directory: %w", err)
-	}
-
-	// Parse templates with error checking
-	templates, err = template.ParseGlob(filepath.Join(templatesDir, "*.html"))
-	if err != nil {
-		return fmt.Errorf("error parsing templates: %w", err)
-	}
-
-	log.Printf("Templates loaded successfully from: %s", templatesDir)
-	return nil
+type Employee struct {
+	ID        int    `json:"id"`
+	Name      string `json:"name"`
+	CardUID   string `json:"card_uid"`
+	IsPresent bool   `json:"is_present"`
 }
 
-// Hash password function
-func hashPassword(password string) string {
-	hash := sha256.Sum256([]byte(password))
-	return hex.EncodeToString(hash[:])
+type TimeRecord struct {
+	ID         int       `json:"id"`
+	EmployeeID int       `json:"employee_id"`
+	ClockIn    time.Time `json:"clock_in"`
+	ClockOut   time.Time `json:"clock_out"`
+	IsComplete bool      `json:"is_complete"`
 }
 
 func initDB() error {
@@ -65,7 +50,6 @@ func initDB() error {
 	if err := os.MkdirAll(dbDir, 0755); err != nil {
 		return fmt.Errorf("failed to create database directory: %w", err)
 	}
-	log.Println("Database directory created/verified at ./db")
 
 	dbPath := filepath.Join(dbDir, "timetrack.db")
 	var err error
@@ -74,20 +58,7 @@ func initDB() error {
 		return fmt.Errorf("failed to open database: %w", err)
 	}
 
-	// Ensure database is closed if initialization fails
-	defer func() {
-		if err != nil {
-			db.Close()
-		}
-	}()
-
-	// Test database connection
-	if err := db.Ping(); err != nil {
-		return fmt.Errorf("database connection test failed: %w", err)
-	}
-	log.Println("Database connection test successful")
-
-	// Create tables
+	// Create tables with RFID card support
 	createTables := `
 	CREATE TABLE IF NOT EXISTS users (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -118,118 +89,182 @@ func initDB() error {
 		FOREIGN KEY (employee_id) REFERENCES employees(id)
 	);
 
-	-- Create indexes for frequently queried columns
-	CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
-	CREATE INDEX IF NOT EXISTS idx_employees_card_uid ON employees(card_uid);
-	CREATE INDEX IF NOT EXISTS idx_time_records_employee_id ON time_records(employee_id);`
+	-- Indexes for better performance
+	CREATE INDEX IF NOT EXISTS idx_card_uid ON employees(card_uid);
+	CREATE INDEX IF NOT EXISTS idx_is_present ON employees(is_present);
+	CREATE INDEX IF NOT EXISTS idx_employee_time ON time_records(employee_id, clock_in);`
 
 	if _, err = db.Exec(createTables); err != nil {
 		return fmt.Errorf("failed to create tables: %w", err)
 	}
-	log.Println("Database tables created successfully")
 
-	// Check if admin user exists
-	var count int
-	if err = db.QueryRow("SELECT COUNT(*) FROM users WHERE username = 'admin'").Scan(&count); err != nil {
-		return fmt.Errorf("failed to check admin user: %w", err)
-	}
-
-	// Create default admin user if it doesn't exist
-	if count == 0 {
-		hashedPassword := hashPassword("admin")
-		if _, err = db.Exec(`
-			INSERT INTO users (username, password, role) 
-			VALUES (?, ?, ?)`,
-			"admin", hashedPassword, "admin"); err != nil {
-			return fmt.Errorf("failed to create admin user: %w", err)
-		}
-		log.Println("Default admin user created successfully!")
-		log.Println("Username: admin")
-		log.Println("Password: admin")
-		log.Println("Please change these credentials after first login!")
-	}
-
-	log.Println("Database initialization completed successfully")
 	return nil
 }
 
-func loginHandler(w http.ResponseWriter, r *http.Request) {
-	// Check for valid HTTP methods
-	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+// RFID card handling functions
+func handleRFIDScan(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	if r.Method == http.MethodPost {
-		username := r.FormValue("username")
-		password := r.FormValue("password")
+	var cardData struct {
+		CardUID string `json:"card_uid"`
+	}
 
-		// Basic input validation
-		if username == "" || password == "" {
-			http.Error(w, "Username and password are required", http.StatusBadRequest)
-			return
-		}
+	if err := json.NewDecoder(r.Body).Decode(&cardData); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
 
-		hashedPassword := hashPassword(password)
+	// Look up employee by card UID
+	var employee Employee
+	err := db.QueryRow("SELECT id, name, is_present FROM employees WHERE card_uid = ?", 
+		cardData.CardUID).Scan(&employee.ID, &employee.Name, &employee.IsPresent)
+	
+	if err == sql.ErrNoRows {
+		http.Error(w, "Unknown card", http.StatusNotFound)
+		return
+	} else if err != nil {
+		log.Printf("Database error: %v", err)
+		http.Error(w, "Server error", http.StatusInternalServerError)
+		return
+	}
 
-		var user User
-		ctx := r.Context()
-		err := db.QueryRowContext(ctx, `
-			SELECT id, username, role 
-			FROM users 
-			WHERE username = ? AND password = ?`,
-			username, hashedPassword).Scan(&user.ID, &user.Username, &user.Role)
+	// Start transaction for clock in/out
+	tx, err := db.Begin()
+	if err != nil {
+		log.Printf("Transaction error: %v", err)
+		http.Error(w, "Server error", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
 
+	now := time.Now()
+	response := map[string]interface{}{
+		"employee_name": employee.Name,
+	}
+
+	if !employee.IsPresent {
+		// Clock in
+		_, err = tx.Exec(`
+			INSERT INTO time_records (employee_id, clock_in)
+			VALUES (?, ?)`, employee.ID, now)
 		if err != nil {
-			if err == sql.ErrNoRows {
-				log.Printf("Failed login attempt for username: %s", username)
-				http.Error(w, "Invalid credentials", http.StatusUnauthorized)
-				return
-			}
-			log.Printf("Database error during login: %v", err)
+			log.Printf("Clock-in error: %v", err)
 			http.Error(w, "Server error", http.StatusInternalServerError)
 			return
 		}
 
-		response := map[string]interface{}{
-			"success": true,
-			"role":    user.Role,
-			"message": fmt.Sprintf("Welcome %s!", user.Username),
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(response); err != nil {
-			log.Printf("Error encoding JSON response: %v", err)
+		_, err = tx.Exec("UPDATE employees SET is_present = TRUE WHERE id = ?", employee.ID)
+		response["action"] = "clock_in"
+		response["message"] = fmt.Sprintf("Welcome %s! Clock-in time: %s", 
+			employee.Name, now.Format("15:04:05"))
+	} else {
+		// Clock out
+		var recordID int
+		err = tx.QueryRow(`
+			SELECT id FROM time_records 
+			WHERE employee_id = ? AND is_completed = FALSE 
+			ORDER BY clock_in DESC LIMIT 1`, employee.ID).Scan(&recordID)
+		if err != nil {
+			log.Printf("Record lookup error: %v", err)
 			http.Error(w, "Server error", http.StatusInternalServerError)
 			return
 		}
+
+		_, err = tx.Exec(`
+			UPDATE time_records 
+			SET clock_out = ?, is_completed = TRUE 
+			WHERE id = ?`, now, recordID)
+		if err != nil {
+			log.Printf("Clock-out error: %v", err)
+			http.Error(w, "Server error", http.StatusInternalServerError)
+			return
+		}
+
+		_, err = tx.Exec("UPDATE employees SET is_present = FALSE WHERE id = ?", employee.ID)
+		response["action"] = "clock_out"
+		response["message"] = fmt.Sprintf("Goodbye %s! Clock-out time: %s", 
+			employee.Name, now.Format("15:04:05"))
+	}
+
+	if err = tx.Commit(); err != nil {
+		log.Printf("Transaction commit error: %v", err)
+		http.Error(w, "Server error", http.StatusInternalServerError)
 		return
 	}
 
-	// Serve login page for GET requests
-	if err := templates.ExecuteTemplate(w, "login.html", nil); err != nil {
-		log.Printf("Template execution error: %v", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// Employee management handlers
+func addEmployeeHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
+	name := r.FormValue("name")
+	cardUID := r.FormValue("card_uid")
+
+	if name == "" || cardUID == "" {
+		http.Error(w, "Name and Card UID are required", http.StatusBadRequest)
+		return
+	}
+
+	_, err := db.Exec(`
+		INSERT INTO employees (name, card_uid)
+		VALUES (?, ?)`, name, cardUID)
+
+	if err != nil {
+		log.Printf("Error adding employee: %v", err)
+		http.Error(w, "Error adding employee", http.StatusInternalServerError)
+		return
+	}
+
+	http.Redirect(w, r, "/admin/dashboard", http.StatusSeeOther)
+}
+
+func getEmployeesHandler(w http.ResponseWriter, r *http.Request) {
+	rows, err := db.Query(`
+		SELECT id, name, card_uid, is_present 
+		FROM employees 
+		ORDER BY name`)
+	if err != nil {
+		log.Printf("Error fetching employees: %v", err)
+		http.Error(w, "Server error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var employees []Employee
+	for rows.Next() {
+		var emp Employee
+		if err := rows.Scan(&emp.ID, &emp.Name, &emp.CardUID, &emp.IsPresent); err != nil {
+			log.Printf("Error scanning employee: %v", err)
+			continue
+		}
+		employees = append(employees, emp)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(employees)
 }
 
 func main() {
-	// Initialize templates
-	if err := initTemplates(); err != nil {
-		log.Fatalf("Failed to initialize templates: %v", err)
-	}
-
-	// Initialize database
 	if err := initDB(); err != nil {
 		log.Fatalf("Failed to initialize database: %v", err)
 	}
 	defer db.Close()
 
-	// Set up HTTP routes
-	http.HandleFunc("/login", loginHandler)
+	// Set up routes
+	http.HandleFunc("/api/rfid/scan", handleRFIDScan)
+	http.HandleFunc("/api/employees", getEmployeesHandler)
+	http.HandleFunc("/admin/employees/add", addEmployeeHandler)
 
-	// Start the server
+	// Start server
 	log.Println("Starting server on :8080...")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		log.Fatalf("Server failed to start: %v", err)
