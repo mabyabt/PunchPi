@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Clock In/Out - Employee Time Tracking</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <header>
+        <h1>Employee Time Tracking</h1>
+        <nav>
+            <ul>
+                <li><a href="/dashboard">Dashboard</a></li>
+                <li><a href="/employees">Employees</a></li>
+                <li><a href="/reports">Reports</a></li>
+                <li><a href="/clock">Clock In/Out</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <h2>Clock In/Out</h2>
+        <section>
+            <h3>Scan Your Card</h3>
+            <p>Place your RFID card near the reader to clock in or out.</p>
+            <div id="clock-status">
+                <p>Status: <span id="status-message">Waiting for card scan...</span></p>
+            </div>
+        </section>
+    </main>
+
+    <footer>
+        <p>&copy; 2023 Employee Time Tracking System</p>
+    </footer>
+
+    <script src="/static/clock.js"></script>
+</body>
+</html>
