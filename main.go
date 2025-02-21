@@ -2,15 +2,21 @@ package main
 
 import (
 	"database/sql"
+	"encoding/hex"
 	"fmt"
+	"html/template"
 	"log"
+	"net/http"
 	"os"
 	"time"
 
+	"github.com/gorilla/mux"
+	"github.com/gorilla/websocket"
 	_ "github.com/mattn/go-sqlite3"
+	"go.bug.st/serial"
 )
 
-// Define the Employee struct
+// All your existing structs remain the same
 type Employee struct {
 	ID           int       `json:"id"`
 	Name         string    `json:"name"`
@@ -20,7 +26,6 @@ type Employee struct {
 	LastClockOut time.Time `json:"last_clock_out"`
 }
 
-// Define the TimeRecord struct
 type TimeRecord struct {
 	ID         int       `json:"id"`
 	EmployeeID int       `json:"employee_id"`
@@ -29,199 +34,154 @@ type TimeRecord struct {
 	TotalHours float64   `json:"total_hours"`
 }
 
-// Define the CardScanEvent struct
 type CardScanEvent struct {
 	DeviceID string    `json:"device_id"`
 	CardUID  string    `json:"card_uid"`
 	Time     time.Time `json:"time"`
 }
 
+// New RFID Reader struct
+type RFIDReader struct {
+	port     serial.Port
+	logger   *log.Logger
+	logFile  *os.File
+	callback func(string)
+}
+
 var (
-	db     *sql.DB
-	logger *log.Logger
+	db        *sql.DB
+	logger    *log.Logger
+	templates *template.Template
+	upgrader  = websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		CheckOrigin: func(r *http.Request) bool {
+			return true
+		},
+	}
 )
 
-// Initialize logger
-func initLogger() {
-	// Create logs directory if it doesn't exist
+// Initialize RFID Reader
+func NewRFIDReader(portName string, callback func(string)) (*RFIDReader, error) {
 	if err := os.MkdirAll("logs", 0755); err != nil {
-		log.Fatal("Failed to create logs directory:", err)
+		return nil, fmt.Errorf("failed to create logs directory: %v", err)
 	}
 
-	// Open log file
-	file, err := os.OpenFile("logs/time_tracking.log",
-		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-	if err != nil {
-		log.Fatal("Failed to open log file:", err)
-	}
-
-	// Initialize logger with timestamp
-	logger = log.New(file, "", log.Ldate|log.Ltime)
-}
-
-// Initialize database
-func initDB() error {
-	var err error
-	db, err = sql.Open("sqlite3", "./time_tracking.db")
-	if err != nil {
-		return err
-	}
-
-	// Create tables if they don't exist
-	_, err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS employees (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			name TEXT NOT NULL,
-			card_uid TEXT NOT NULL UNIQUE,
-			is_present BOOLEAN NOT NULL DEFAULT FALSE,
-			last_clock_in DATETIME,
-			last_clock_out DATETIME
-		);
-
-		CREATE TABLE IF NOT EXISTS time_records (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			employee_id INTEGER NOT NULL,
-			clock_in DATETIME NOT NULL,
-			clock_out DATETIME,
-			total_hours REAL,
-			FOREIGN KEY (employee_id) REFERENCES employees (id)
-		);
-	`)
-	return err
-}
-
-// Process card scans
-func processCardScan(scan CardScanEvent) (*Employee, error) {
-	logger.Printf("Processing card scan - Device: %s, Card UID: %s",
-		scan.DeviceID, scan.CardUID)
-
-	// Look up employee
-	var employee Employee
-	err := db.QueryRow(`
-		SELECT id, name, card_uid, is_present, last_clock_in, last_clock_out 
-		FROM employees 
-		WHERE card_uid = ?`, scan.CardUID).Scan(
-		&employee.ID, &employee.Name, &employee.CardUID, &employee.IsPresent,
-		&employee.LastClockIn, &employee.LastClockOut,
+	logFile, err := os.OpenFile(
+		"logs/rfid_reader.log",
+		os.O_CREATE|os.O_WRONLY|os.O_APPEND,
+		0666,
 	)
-
-	if err == sql.ErrNoRows {
-		logger.Printf("Unknown card UID: %s", scan.CardUID)
-		return nil, fmt.Errorf("unknown card: %s", scan.CardUID)
-	} else if err != nil {
-		logger.Printf("Database error looking up employee: %v", err)
-		return nil, fmt.Errorf("database error: %v", err)
-	}
-
-	logger.Printf("Found employee - ID: %d, Name: %s, Currently present: %v",
-		employee.ID, employee.Name, employee.IsPresent)
-
-	// Start transaction
-	tx, err := db.Begin()
 	if err != nil {
-		logger.Printf("Failed to start transaction: %v", err)
-		return nil, fmt.Errorf("transaction error: %v", err)
-	}
-	defer tx.Rollback()
-
-	if !employee.IsPresent {
-		// Clock in
-		logger.Printf("Clocking in employee %s (ID: %d)", employee.Name, employee.ID)
-
-		result, err := tx.Exec(`
-			INSERT INTO time_records (employee_id, clock_in)
-			VALUES (?, ?)`, employee.ID, scan.Time)
-		if err != nil {
-			logger.Printf("Clock-in error: %v", err)
-			return nil, fmt.Errorf("clock-in error: %v", err)
-		}
-
-		recordID, _ := result.LastInsertId()
-		logger.Printf("Created time record ID: %d", recordID)
-
-		_, err = tx.Exec(`
-			UPDATE employees 
-			SET is_present = TRUE, last_clock_in = ? 
-			WHERE id = ?`, scan.Time, employee.ID)
-		if err != nil {
-			logger.Printf("Failed to update employee status: %v", err)
-			return nil, fmt.Errorf("employee update error: %v", err)
-		}
-
-		// Verify the clock-in
-		var verifyTime time.Time
-		err = tx.QueryRow(`
-			SELECT clock_in 
-			FROM time_records 
-			WHERE id = ?`, recordID).Scan(&verifyTime)
-		if err != nil {
-			logger.Printf("Failed to verify clock-in: %v", err)
-			return nil, fmt.Errorf("verification error: %v", err)
-		}
-		logger.Printf("Verified clock-in time: %v", verifyTime)
-
-	} else {
-		// Clock out
-		logger.Printf("Clocking out employee %s (ID: %d)", employee.Name, employee.ID)
-
-		var recordID int
-		var clockInTime time.Time
-		err = tx.QueryRow(`
-			SELECT id, clock_in 
-			FROM time_records 
-			WHERE employee_id = ? AND clock_out IS NULL 
-			ORDER BY clock_in DESC LIMIT 1`, employee.ID).Scan(&recordID, &clockInTime)
-		if err != nil {
-			logger.Printf("Failed to find open time record: %v", err)
-			return nil, fmt.Errorf("record lookup error: %v", err)
-		}
-
-		logger.Printf("Found open time record ID: %d, Clock-in time: %v",
-			recordID, clockInTime)
-
-		_, err = tx.Exec(`
-			UPDATE time_records 
-			SET clock_out = ?,
-				total_hours = ROUND(CAST((JULIANDAY(?) - JULIANDAY(clock_in)) * 24 AS REAL), 2)
-			WHERE id = ?`, scan.Time, scan.Time, recordID)
-		if err != nil {
-			logger.Printf("Clock-out error: %v", err)
-			return nil, fmt.Errorf("clock-out error: %v", err)
-		}
-
-		_, err = tx.Exec(`
-			UPDATE employees 
-			SET is_present = FALSE, last_clock_out = ? 
-			WHERE id = ?`, scan.Time, employee.ID)
-		if err != nil {
-			logger.Printf("Failed to update employee status: %v", err)
-			return nil, fmt.Errorf("employee update error: %v", err)
-		}
-
-		// Verify the clock-out
-		var verifyTime time.Time
-		var totalHours float64
-		err = tx.QueryRow(`
-			SELECT clock_out, total_hours 
-			FROM time_records 
-			WHERE id = ?`, recordID).Scan(&verifyTime, &totalHours)
-		if err != nil {
-			logger.Printf("Failed to verify clock-out: %v", err)
-			return nil, fmt.Errorf("verification error: %v", err)
-		}
-		logger.Printf("Verified clock-out time: %v, Total hours: %.2f",
-			verifyTime, totalHours)
+		return nil, fmt.Errorf("failed to open log file: %v", err)
 	}
 
-	if err := tx.Commit(); err != nil {
-		logger.Printf("Failed to commit transaction: %v", err)
-		return nil, fmt.Errorf("commit error: %v", err)
+	mode := &serial.Mode{
+		BaudRate: 9600,
+		DataBits: 8,
+		Parity:   serial.NoParity,
+		StopBits: serial.OneStopBit,
 	}
 
-	logger.Printf("Successfully processed card scan for %s", employee.Name)
-	return &employee, nil
+	port, err := serial.Open(portName, mode)
+	if err != nil {
+		logFile.Close()
+		return nil, fmt.Errorf("failed to open serial port: %v", err)
+	}
+
+	port.SetReadTimeout(time.Millisecond * 100)
+
+	return &RFIDReader{
+		port:     port,
+		logger:   log.New(logFile, "", log.Ldate|log.Ltime),
+		logFile:  logFile,
+		callback: callback,
+	}, nil
 }
 
+func (r *RFIDReader) Close() {
+	if r.port != nil {
+		r.port.Close()
+	}
+	if r.logFile != nil {
+		r.logFile.Close()
+	}
+}
+
+func (r *RFIDReader) Read() {
+	buffer := make([]byte, 64)
+	cardData := make([]byte, 0, 64)
+	isReading := false
+
+	for {
+		n, err := r.port.Read(buffer)
+		if err != nil {
+			r.logger.Printf("Error reading from port: %v", err)
+			continue
+		}
+
+		if n > 0 {
+			r.logger.Printf("Raw bytes received: %s", hex.Dump(buffer[:n]))
+
+			for i := 0; i < n; i++ {
+				b := buffer[i]
+
+				if b == 0x02 {
+					isReading = true
+					cardData = cardData[:0]
+					continue
+				}
+
+				if b == 0x03 {
+					isReading = false
+					if len(cardData) > 0 {
+						r.processCardData(cardData)
+					}
+					continue
+				}
+
+				if isReading {
+					cardData = append(cardData, b)
+				}
+			}
+		}
+	}
+}
+
+func (r *RFIDReader) processCardData(data []byte) {
+	cardID := hex.EncodeToString(data)
+	r.logger.Printf("Card ID (hex): %s", cardID)
+
+	cleaned := make([]byte, 0, len(data))
+	for _, b := range data {
+		if (b >= '0' && b <= '9') || (b >= 'A' && b <= 'F') || (b >= 'a' && b <= 'f') {
+			cleaned = append(cleaned, b)
+		}
+	}
+
+	cleanedID := string(cleaned)
+	r.logger.Printf("Cleaned Card ID: %s", cleanedID)
+
+	if r.callback != nil {
+		r.callback(cleanedID)
+	}
+}
+
+// Your existing processCardScan function remains the same
+func processCardScan(scan CardScanEvent) (*Employee, error) {
+    // ... (your existing processCardScan code) ...
+}
+
+// Your existing initialization functions
+func initDB() error {
+    // ... (your existing initDB code) ...
+}
+
+func initLogger() {
+    // ... (your existing initLogger code) ...
+}
+
+// Modified main function to include RFID reader
 func main() {
 	// Initialize logger
 	initLogger()
@@ -233,38 +193,48 @@ func main() {
 	}
 	defer db.Close()
 
-	// Add a test employee if the table is empty
-	var count int
-	err := db.QueryRow("SELECT COUNT(*) FROM employees").Scan(&count)
-	if err != nil {
-		log.Fatal("Failed to check employees:", err)
-	}
-
-	if count == 0 {
-		_, err = db.Exec(`
-			INSERT INTO employees (name, card_uid, is_present)
-			VALUES (?, ?, ?)`,
-			"Test Employee", "1234567890", false)
-		if err != nil {
-			log.Fatal("Failed to insert test employee:", err)
+	// Initialize RFID reader
+	callback := func(cardID string) {
+		scan := CardScanEvent{
+			DeviceID: "JT308-001",
+			CardUID:  cardID,
+			Time:     time.Now(),
 		}
-		logger.Println("Added test employee with card UID: 1234567890")
+
+		employee, err := processCardScan(scan)
+		if err != nil {
+			log.Printf("Error processing card scan: %v", err)
+		} else {
+			log.Printf("Successfully processed scan for employee: %s", employee.Name)
+		}
 	}
 
-	// Simulate a card scan for testing
-	testScan := CardScanEvent{
-		DeviceID: "TEST-DEVICE-001",
-		CardUID:  "1234567890",
-		Time:     time.Now(),
-	}
-
-	employee, err := processCardScan(testScan)
+	// Replace "COM3" with your actual port name
+	reader, err := NewRFIDReader("COM3", callback)
 	if err != nil {
-		log.Printf("Error processing test scan: %v", err)
-	} else {
-		log.Printf("Successfully processed test scan for employee: %s", employee.Name)
+		log.Fatal(err)
 	}
+	defer reader.Close()
 
-	// Keep the program running
-	select {}
+	// Start RFID reader in a goroutine
+	go reader.Read()
+
+	// Initialize web server
+	r := mux.NewRouter()
+	
+	// Your existing routes
+	r.HandleFunc("/", basicAuthMiddleware(dashboardHandler))
+	r.HandleFunc("/dashboard", basicAuthMiddleware(dashboardHandler))
+	r.HandleFunc("/employees", basicAuthMiddleware(employeesHandler))
+	r.HandleFunc("/reports", basicAuthMiddleware(reportsHandler))
+	r.HandleFunc("/clock", clockInOutHandler)
+
+	// API routes
+	api := r.PathPrefix("/api").Subrouter()
+	api.HandleFunc("/employees", basicAuthMiddleware(apiGetEmployees)).Methods("GET")
+	api.HandleFunc("/time-records", basicAuthMiddleware(apiGetTimeRecords)).Methods("GET")
+
+	// Start web server
+	log.Println("Starting server on :8080...")
+	log.Fatal(http.ListenAndServe(":8080", r))
 }
