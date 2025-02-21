@@ -1,240 +1,177 @@
-package main
+// Add these additional functions to your code:
 
-import (
-	"database/sql"
-	"encoding/hex"
-	"fmt"
-	"html/template"
-	"log"
-	"net/http"
-	"os"
-	"time"
-
-	"github.com/gorilla/mux"
-	"github.com/gorilla/websocket"
-	_ "github.com/mattn/go-sqlite3"
-	"go.bug.st/serial"
-)
-
-// All your existing structs remain the same
-type Employee struct {
-	ID           int       `json:"id"`
-	Name         string    `json:"name"`
-	CardUID      string    `json:"card_uid"`
-	IsPresent    bool      `json:"is_present"`
-	LastClockIn  time.Time `json:"last_clock_in"`
-	LastClockOut time.Time `json:"last_clock_out"`
+// Basic Auth Middleware implementation
+func basicAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        user, pass, ok := r.BasicAuth()
+        if !ok || user != "admin" || pass != "password" { // Change these credentials
+            w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
+            http.Error(w, "Unauthorized", http.StatusUnauthorized)
+            return
+        }
+        next.ServeHTTP(w, r)
+    }
 }
 
-type TimeRecord struct {
-	ID         int       `json:"id"`
-	EmployeeID int       `json:"employee_id"`
-	ClockIn    time.Time `json:"clock_in"`
-	ClockOut   time.Time `json:"clock_out"`
-	TotalHours float64   `json:"total_hours"`
+// Template handlers
+func dashboardHandler(w http.ResponseWriter, r *http.Request) {
+    data := struct {
+        Title string
+        Time  time.Time
+    }{
+        Title: "Dashboard",
+        Time:  time.Now(),
+    }
+    err := templates.ExecuteTemplate(w, "dashboard.html", data)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+    }
 }
 
-type CardScanEvent struct {
-	DeviceID string    `json:"device_id"`
-	CardUID  string    `json:"card_uid"`
-	Time     time.Time `json:"time"`
+func employeesHandler(w http.ResponseWriter, r *http.Request) {
+    data := struct {
+        Title string
+    }{
+        Title: "Employees",
+    }
+    err := templates.ExecuteTemplate(w, "employees.html", data)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+    }
 }
 
-// New RFID Reader struct
-type RFIDReader struct {
-	port     serial.Port
-	logger   *log.Logger
-	logFile  *os.File
-	callback func(string)
+func reportsHandler(w http.ResponseWriter, r *http.Request) {
+    data := struct {
+        Title string
+    }{
+        Title: "Reports",
+    }
+    err := templates.ExecuteTemplate(w, "reports.html", data)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+    }
 }
 
-var (
-	db        *sql.DB
-	logger    *log.Logger
-	templates *template.Template
-	upgrader  = websocket.Upgrader{
-		ReadBufferSize:  1024,
-		WriteBufferSize: 1024,
-		CheckOrigin: func(r *http.Request) bool {
-			return true
-		},
-	}
-)
-
-// Initialize RFID Reader
-func NewRFIDReader(portName string, callback func(string)) (*RFIDReader, error) {
-	if err := os.MkdirAll("logs", 0755); err != nil {
-		return nil, fmt.Errorf("failed to create logs directory: %v", err)
-	}
-
-	logFile, err := os.OpenFile(
-		"logs/rfid_reader.log",
-		os.O_CREATE|os.O_WRONLY|os.O_APPEND,
-		0666,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open log file: %v", err)
-	}
-
-	mode := &serial.Mode{
-		BaudRate: 9600,
-		DataBits: 8,
-		Parity:   serial.NoParity,
-		StopBits: serial.OneStopBit,
-	}
-
-	port, err := serial.Open(portName, mode)
-	if err != nil {
-		logFile.Close()
-		return nil, fmt.Errorf("failed to open serial port: %v", err)
-	}
-
-	port.SetReadTimeout(time.Millisecond * 100)
-
-	return &RFIDReader{
-		port:     port,
-		logger:   log.New(logFile, "", log.Ldate|log.Ltime),
-		logFile:  logFile,
-		callback: callback,
-	}, nil
+func clockInOutHandler(w http.ResponseWriter, r *http.Request) {
+    data := struct {
+        Title string
+    }{
+        Title: "Clock In/Out",
+    }
+    err := templates.ExecuteTemplate(w, "clock.html", data)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+    }
 }
 
-func (r *RFIDReader) Close() {
-	if r.port != nil {
-		r.port.Close()
-	}
-	if r.logFile != nil {
-		r.logFile.Close()
-	}
+// Modified RFID reader initialization with retry
+func initRFIDReader(portName string, callback func(string)) (*RFIDReader, error) {
+    var reader *RFIDReader
+    var err error
+    maxRetries := 5
+    
+    for i := 0; i < maxRetries; i++ {
+        reader, err = NewRFIDReader(portName, callback)
+        if err == nil {
+            return reader, nil
+        }
+        log.Printf("Failed to initialize RFID reader (attempt %d/%d): %v", i+1, maxRetries, err)
+        time.Sleep(time.Second * 2)
+    }
+    return nil, fmt.Errorf("failed to initialize RFID reader after %d attempts: %v", maxRetries, err)
 }
 
-func (r *RFIDReader) Read() {
-	buffer := make([]byte, 64)
-	cardData := make([]byte, 0, 64)
-	isReading := false
-
-	for {
-		n, err := r.port.Read(buffer)
-		if err != nil {
-			r.logger.Printf("Error reading from port: %v", err)
-			continue
-		}
-
-		if n > 0 {
-			r.logger.Printf("Raw bytes received: %s", hex.Dump(buffer[:n]))
-
-			for i := 0; i < n; i++ {
-				b := buffer[i]
-
-				if b == 0x02 {
-					isReading = true
-					cardData = cardData[:0]
-					continue
-				}
-
-				if b == 0x03 {
-					isReading = false
-					if len(cardData) > 0 {
-						r.processCardData(cardData)
-					}
-					continue
-				}
-
-				if isReading {
-					cardData = append(cardData, b)
-				}
-			}
-		}
-	}
-}
-
-func (r *RFIDReader) processCardData(data []byte) {
-	cardID := hex.EncodeToString(data)
-	r.logger.Printf("Card ID (hex): %s", cardID)
-
-	cleaned := make([]byte, 0, len(data))
-	for _, b := range data {
-		if (b >= '0' && b <= '9') || (b >= 'A' && b <= 'F') || (b >= 'a' && b <= 'f') {
-			cleaned = append(cleaned, b)
-		}
-	}
-
-	cleanedID := string(cleaned)
-	r.logger.Printf("Cleaned Card ID: %s", cleanedID)
-
-	if r.callback != nil {
-		r.callback(cleanedID)
-	}
-}
-
-// Your existing processCardScan function remains the same
-func processCardScan(scan CardScanEvent) (*Employee, error) {
-    // ... (your existing processCardScan code) ...
-}
-
-// Your existing initialization functions
-func initDB() error {
-    // ... (your existing initDB code) ...
-}
-
-func initLogger() {
-    // ... (your existing initLogger code) ...
-}
-
-// Modified main function to include RFID reader
+// Modified main function with better error handling
 func main() {
-	// Initialize logger
-	initLogger()
-	logger.Println("Starting time tracking application...")
+    // Initialize logger
+    initLogger()
+    logger.Println("Starting time tracking application...")
 
-	// Initialize database
-	if err := initDB(); err != nil {
-		log.Fatal("Failed to initialize database:", err)
-	}
-	defer db.Close()
+    // Initialize templates
+    var err error
+    templates, err = template.ParseGlob("templates/*.html")
+    if err != nil {
+        log.Fatalf("Failed to parse templates: %v", err)
+    }
 
-	// Initialize RFID reader
-	callback := func(cardID string) {
-		scan := CardScanEvent{
-			DeviceID: "JT308-001",
-			CardUID:  cardID,
-			Time:     time.Now(),
-		}
+    // Initialize database
+    if err := initDB(); err != nil {
+        log.Fatalf("Failed to initialize database: %v", err)
+    }
+    defer db.Close()
 
-		employee, err := processCardScan(scan)
-		if err != nil {
-			log.Printf("Error processing card scan: %v", err)
-		} else {
-			log.Printf("Successfully processed scan for employee: %s", employee.Name)
-		}
-	}
+    // Initialize RFID reader with retry
+    callback := func(cardID string) {
+        scan := CardScanEvent{
+            DeviceID: "JT308-001",
+            CardUID:  cardID,
+            Time:     time.Now(),
+        }
 
-	// Replace "COM3" with your actual port name
-	reader, err := NewRFIDReader("COM3", callback)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer reader.Close()
+        employee, err := processCardScan(scan)
+        if err != nil {
+            log.Printf("Error processing card scan: %v", err)
+            return
+        }
+        log.Printf("Successfully processed scan for employee: %s", employee.Name)
+    }
 
-	// Start RFID reader in a goroutine
-	go reader.Read()
+    // Detect OS and set appropriate port name
+    portName := "COM3" // Default for Windows
+    if os.Getenv("GOOS") == "linux" {
+        portName = "/dev/ttyUSB0"
+    } else if os.Getenv("GOOS") == "darwin" {
+        portName = "/dev/tty.usbserial-*"
+    }
 
-	// Initialize web server
-	r := mux.NewRouter()
-	
-	// Your existing routes
-	r.HandleFunc("/", basicAuthMiddleware(dashboardHandler))
-	r.HandleFunc("/dashboard", basicAuthMiddleware(dashboardHandler))
-	r.HandleFunc("/employees", basicAuthMiddleware(employeesHandler))
-	r.HandleFunc("/reports", basicAuthMiddleware(reportsHandler))
-	r.HandleFunc("/clock", clockInOutHandler)
+    // Override port name if specified in environment
+    if envPort := os.Getenv("RFID_PORT"); envPort != "" {
+        portName = envPort
+    }
 
-	// API routes
-	api := r.PathPrefix("/api").Subrouter()
-	api.HandleFunc("/employees", basicAuthMiddleware(apiGetEmployees)).Methods("GET")
-	api.HandleFunc("/time-records", basicAuthMiddleware(apiGetTimeRecords)).Methods("GET")
+    reader, err := initRFIDReader(portName, callback)
+    if err != nil {
+        log.Fatalf("Failed to initialize RFID reader: %v", err)
+    }
+    defer reader.Close()
 
-	// Start web server
-	log.Println("Starting server on :8080...")
-	log.Fatal(http.ListenAndServe(":8080", r))
+    // Start RFID reader in a goroutine with recovery
+    go func() {
+        defer func() {
+            if r := recover(); r != nil {
+                log.Printf("RFID reader panic recovered: %v", r)
+            }
+        }()
+        reader.Read()
+    }()
+
+    // Create router
+    r := mux.NewRouter()
+
+    // Static file server
+    r.PathPrefix("/static/").Handler(http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
+
+    // Routes
+    r.HandleFunc("/", basicAuthMiddleware(dashboardHandler))
+    r.HandleFunc("/dashboard", basicAuthMiddleware(dashboardHandler))
+    r.HandleFunc("/employees", basicAuthMiddleware(employeesHandler))
+    r.HandleFunc("/reports", basicAuthMiddleware(reportsHandler))
+    r.HandleFunc("/clock", clockInOutHandler)
+
+    // API routes
+    api := r.PathPrefix("/api").Subrouter()
+    api.HandleFunc("/employees", basicAuthMiddleware(apiGetEmployees)).Methods("GET")
+    api.HandleFunc("/time-records", basicAuthMiddleware(apiGetTimeRecords)).Methods("GET")
+
+    // Server configuration with timeouts
+    srv := &http.Server{
+        Handler:      r,
+        Addr:         ":8080",
+        WriteTimeout: 15 * time.Second,
+        ReadTimeout:  15 * time.Second,
+    }
+
+    // Start server
+    log.Println("Starting server on :8080...")
+    log.Fatal(srv.ListenAndServe())
 }
