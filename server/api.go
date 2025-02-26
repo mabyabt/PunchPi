@@ -5,11 +5,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
 type ScanRequest struct {
 	UID string `json:"uid"`
+}
+
+// normalizeRFIDInput takes an RFID UID string and returns both the original
+// and a normalized version (converted to uppercase with spaces removed)
+func normalizeRFIDInput(uid string) (string, string) {
+	originalUID := uid
+	normalizedUID := strings.ToUpper(strings.ReplaceAll(uid, " ", ""))
+	return originalUID, normalizedUID
 }
 
 func handleRFIDScan(w http.ResponseWriter, r *http.Request, db *sql.DB) {
