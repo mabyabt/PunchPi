@@ -3,7 +3,6 @@ package main
 import (
 	"database/sql"
 	"fmt"
-	"html/template"
 	"log"
 	"net/http"
 	"path/filepath"
@@ -13,9 +12,6 @@ import (
 )
 
 const dbFile = "rfid_attendance.db"
-
-// Templates
-var templates = template.Must(template.ParseGlob("templates/*.html"))
 
 // User represents data from the users table
 type User struct {
@@ -70,11 +66,8 @@ func main() {
 		logsHandler(w, r, db)
 	})
 
-	// Create directories for templates and static files if they don't exist
+	// Create static directory if it doesn't exist
 	ensureDirectories()
-	
-	// Create initial templates if they don't exist
-	createInitialTemplates()
 
 	fmt.Println("Server running on :8080...")
 	fmt.Println("Web interface available at http://localhost:8080")
@@ -82,11 +75,6 @@ func main() {
 }
 
 func ensureDirectories() {
-	// Create templates directory
-	if err := ensureDir("templates"); err != nil {
-		log.Fatal("Error creating templates directory:", err)
-	}
-	
 	// Create static directory
 	if err := ensureDir("static"); err != nil {
 		log.Fatal("Error creating static directory:", err)
@@ -100,11 +88,6 @@ func ensureDirectories() {
 
 func ensureDir(dirName string) error {
 	return nil // Placeholder - we'll implement file operations in the HTTP handlers for simplicity
-}
-
-func createInitialTemplates() {
-	// We'll implement this in the HTTP handlers
-	// This is just a placeholder function
 }
 
 func homeHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
