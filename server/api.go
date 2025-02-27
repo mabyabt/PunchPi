@@ -5,20 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
 )
 
 type ScanRequest struct {
 	UID string `json:"uid"`
-}
-
-// normalizeRFIDInput takes an RFID UID string and returns both the original
-// and a normalized version (converted to uppercase with spaces removed)
-func normalizeRFIDInput(uid string) (string, string) {
-	originalUID := uid
-	normalizedUID := strings.ToUpper(strings.ReplaceAll(uid, " ", ""))
-	return originalUID, normalizedUID
 }
 
 func handleRFIDScan(w http.ResponseWriter, r *http.Request, db *sql.DB) {
@@ -34,14 +25,15 @@ func handleRFIDScan(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		return
 	}
 
-	originalUID, normalizedUID := normalizeRFIDInput(req.UID)
+	// Use only the original UID for searching
+	originalUID := req.UID
 
-	// Look up user by UID
+	// Look up user by original UID only
 	var userName string
 	var userId int
 	err = db.QueryRow(`
-		SELECT id, name FROM users WHERE rfid_uid_original = ? OR rfid_uid_normalized = ?`,
-		originalUID, normalizedUID).Scan(&userId, &userName)
+		SELECT id, name FROM users WHERE rfid_uid_original = ?`,
+		originalUID).Scan(&userId, &userName)
 
 	if err == sql.ErrNoRows {
 		http.Error(w, "Unknown RFID card", http.StatusNotFound)
@@ -63,8 +55,8 @@ func handleRFIDScan(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	}
 
 	_, err = db.Exec(
-		"INSERT INTO clock_in_out (rfid_uid_original, rfid_uid_normalized, user_id, timestamp) VALUES (?, ?, ?, datetime('now'))",
-		originalUID, normalizedUID, userId)
+		"INSERT INTO clock_in_out (rfid_uid_original, user_id, timestamp) VALUES (?, ?, datetime('now'))",
+		originalUID, userId)
 
 	if err != nil {
 		http.Error(w, "Failed to record scan", http.StatusInternalServerError)
