@@ -5,11 +5,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
 type ScanRequest struct {
 	UID string `json:"uid"`
+}
+
+// normalizeRFIDInput takes an RFID UID string and returns both the original
+// and a normalized version (converted to uppercase with spaces removed)
+func normalizeRFIDInput(uid string) (string, string) {
+	originalUID := uid
+	normalizedUID := strings.ToUpper(strings.ReplaceAll(uid, " ", ""))
+	return originalUID, normalizedUID
 }
 
 func handleRFIDScan(w http.ResponseWriter, r *http.Request, db *sql.DB) {
@@ -25,8 +34,9 @@ func handleRFIDScan(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		return
 	}
 
-	// Use only the original UID for searching
-	originalUID := req.UID
+	// Keep the normalizeRFIDInput function for other code,
+	// but only use the original UID for database search
+	originalUID, normalizedUID := normalizeRFIDInput(req.UID)
 
 	// Look up user by original UID only
 	var userName string
@@ -54,9 +64,11 @@ func handleRFIDScan(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		eventType = "Clock-Out"
 	}
 
+	// Store both original and normalized UID in the database
+	// for consistency with your current schema
 	_, err = db.Exec(
-		"INSERT INTO clock_in_out (rfid_uid_original, user_id, timestamp) VALUES (?, ?, datetime('now'))",
-		originalUID, userId)
+		"INSERT INTO clock_in_out (rfid_uid_original, rfid_uid_normalized, user_id, timestamp) VALUES (?, ?, ?, datetime('now'))",
+		originalUID, normalizedUID, userId)
 
 	if err != nil {
 		http.Error(w, "Failed to record scan", http.StatusInternalServerError)
